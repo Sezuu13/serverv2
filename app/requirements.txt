@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+tensorflow-cpu==2.18.0
+numpy
+pydantic
+
+mediapipe
+opencv-python-headless

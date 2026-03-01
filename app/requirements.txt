@@ -1,8 +1,7 @@
 fastapi
 uvicorn[standard]
-tensorflow-cpu==2.18.0
+tensorflow-cpu
 numpy
 pydantic
-
 mediapipe
 opencv-python-headless

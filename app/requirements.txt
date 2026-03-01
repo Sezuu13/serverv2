@@ -3,5 +3,5 @@ uvicorn[standard]
 tensorflow-cpu
 numpy
 pydantic
-mediapipe
+mediapipe==0.10.14
 opencv-python-headless

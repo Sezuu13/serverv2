@@ -139,6 +139,25 @@ def _results_to_landmarks(results):
 
     return landmarks
 
+
+def orient_frame(frame_bgr, rotation=0, is_front_camera=False):
+    """Rotate and flip a frame so it is upright for MediaPipe.
+
+    Mobile camera sensors are typically rotated 90° or 270° relative to
+    the device's natural orientation.  The Flutter camera plugin reports
+    the sensor orientation but does NOT auto-rotate the raw NV21 bytes,
+    so the server must correct it here.
+    """
+    if rotation == 90:
+        frame_bgr = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    elif rotation == 180:
+        frame_bgr = cv2.rotate(frame_bgr, cv2.ROTATE_180)
+    elif rotation == 270:
+        frame_bgr = cv2.rotate(frame_bgr, cv2.ROTATE_90_CLOCKWISE)
+    if is_front_camera:
+        frame_bgr = cv2.flip(frame_bgr, 1)  # horizontal mirror
+    return frame_bgr
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -155,6 +174,8 @@ class NV21Frame(BaseModel):
     base64_data: str
     width: int
     height: int
+    rotation: Optional[int] = 0
+    is_front_camera: Optional[bool] = False
 
 class FramesRequest(BaseModel):
     frames: List[NV21Frame]
@@ -229,13 +250,35 @@ async def predict_frames(request: FramesRequest):
             raise HTTPException(status_code=400, detail=f"Expected {SEQUENCE_LENGTH} frames")
 
         all_landmarks = []
-        for frame_data in request.frames:
+        non_zero_frames = 0
+        for i, frame_data in enumerate(request.frames):
             raw_bytes = base64.b64decode(frame_data.base64_data)
-            yuv = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((int(frame_data.height * 1.5), frame_data.width))
+            yuv = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(
+                (int(frame_data.height * 1.5), frame_data.width)
+            )
             bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV21)
+
+            # Rotate / flip to upright orientation
+            bgr = orient_frame(
+                bgr,
+                rotation=frame_data.rotation or 0,
+                is_front_camera=frame_data.is_front_camera or False,
+            )
+
+            if i == 0:
+                print(
+                    f"[predict_frames] frame-0 decoded to {bgr.shape}, "
+                    f"rotation={frame_data.rotation}, front={frame_data.is_front_camera}"
+                )
+
             landmarks = extract_landmarks_from_frame(bgr)
+            non_zero = sum(1 for v in landmarks if v != 0.0)
+            if non_zero > 0:
+                non_zero_frames += 1
             all_landmarks.append(landmarks)
-            
+
+        print(f"[predict_frames] {non_zero_frames}/{SEQUENCE_LENGTH} frames had non-zero landmarks")
+
         input_data = np.array(all_landmarks, dtype=np.float32).reshape(1, SEQUENCE_LENGTH, N_FEATURES)
         output = model.predict(input_data, verbose=0)
         probabilities = output[0]
@@ -243,13 +286,18 @@ async def predict_frames(request: FramesRequest):
         pred_label = LABELS[pred_index]
         confidence = float(probabilities[pred_index])
         all_preds = {LABELS[i]: round(float(probabilities[i]), 4) for i in range(len(LABELS))}
-        
+
+        print(f"[predict_frames] Prediction: {pred_label} ({confidence:.4f})")
+
         return PredictionResponse(
             label=pred_label,
             confidence=round(confidence, 4),
             all_predictions=all_preds,
         )
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"[predict_frames] ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -301,6 +349,35 @@ async def predict_web_frames(request: WebFramesRequest):
     except Exception as e:
         print(f"[predict_web_frames] ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/debug_frame")
+async def debug_frame(frame: NV21Frame):
+    """Diagnostic: decode a single NV21 frame, extract landmarks, return stats."""
+    try:
+        raw_bytes = base64.b64decode(frame.base64_data)
+        yuv = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(
+            (int(frame.height * 1.5), frame.width)
+        )
+        bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV21)
+        bgr = orient_frame(bgr, rotation=frame.rotation or 0, is_front_camera=frame.is_front_camera or False)
+
+        landmarks = extract_landmarks_from_frame(bgr)
+        non_zero = sum(1 for v in landmarks if v != 0.0)
+        sample = {f"idx_{i}": round(v, 4) for i, v in enumerate(landmarks) if v != 0.0}
+        sample = dict(list(sample.items())[:10])  # first 10 non-zero
+
+        return {
+            "frame_shape": list(bgr.shape),
+            "rotation_applied": frame.rotation,
+            "is_front_camera": frame.is_front_camera,
+            "total_landmarks": len(landmarks),
+            "non_zero_count": non_zero,
+            "sample_non_zero": sample,
+            "has_body": non_zero > 0,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/api/info")

@@ -69,7 +69,7 @@ app = FastAPI(
 # ── Static files directory ───────────────────────────────────────────
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
-# Initialize mediapipe holistic
+# Initialize mediapipe holistic for /predict_frames (NV21 video frames — sequential)
 mp_holistic = mp.solutions.holistic
 holistic = mp_holistic.Holistic(
     min_detection_confidence=0.5,
@@ -78,33 +78,54 @@ holistic = mp_holistic.Holistic(
 )
 
 def extract_landmarks_from_frame(frame_bgr):
+    """Extract landmarks from a single frame using the global holistic instance.
+    Used for sequential NV21 video frames (predict_frames endpoint)."""
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     frame_rgb.flags.writeable = False
     results = holistic.process(frame_rgb)
+    return _results_to_landmarks(results)
 
+
+def extract_landmarks_static(frame_bgr):
+    """Extract landmarks in static image mode — best for independent JPEG frames
+    from the web (predict_web_frames endpoint). Creates its own holistic each time
+    a batch is processed for thread safety."""
+    with mp_holistic.Holistic(
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+        static_image_mode=True
+    ) as h:
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        frame_rgb.flags.writeable = False
+        results = h.process(frame_rgb)
+        return _results_to_landmarks(results)
+
+
+def _results_to_landmarks(results):
+    """Convert MediaPipe holistic results to 285-element landmark array."""
     landmarks = []
-    # Left hand
+    # Left hand (21 × 3 = 63)
     if results.left_hand_landmarks:
         for lm in results.left_hand_landmarks.landmark:
             landmarks.extend([lm.x, lm.y, lm.z])
     else:
         landmarks.extend([0.0] * 63)
 
-    # Right hand
+    # Right hand (21 × 3 = 63)
     if results.right_hand_landmarks:
         for lm in results.right_hand_landmarks.landmark:
             landmarks.extend([lm.x, lm.y, lm.z])
     else:
         landmarks.extend([0.0] * 63)
 
-    # Pose
+    # Pose world landmarks (33 × 3 = 99)
     if results.pose_world_landmarks:
         for lm in results.pose_world_landmarks.landmark:
             landmarks.extend([lm.x, lm.y, lm.z])
     else:
         landmarks.extend([0.0] * 99)
 
-    # Face
+    # Face (20 selected landmarks × 3 = 60)
     key_indices = [0, 1, 4, 5, 9, 10, 13, 14, 17, 18, 21, 33, 36, 39, 42, 45, 48, 51, 54, 57]
     if results.face_landmarks:
         for idx in key_indices:
@@ -240,7 +261,8 @@ async def predict_web_frames(request: WebFramesRequest):
             raise HTTPException(status_code=400, detail=f"Expected {SEQUENCE_LENGTH} frames")
 
         all_landmarks = []
-        for frame_data in request.frames:
+        non_zero_frames = 0
+        for i, frame_data in enumerate(request.frames):
             # Remove data URL prefix if present
             b64 = frame_data.base64_data
             if "," in b64:
@@ -249,9 +271,15 @@ async def predict_web_frames(request: WebFramesRequest):
             nparr = np.frombuffer(raw_bytes, np.uint8)
             bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             if bgr is None:
-                raise HTTPException(status_code=400, detail="Failed to decode frame image")
-            landmarks = extract_landmarks_from_frame(bgr)
+                raise HTTPException(status_code=400, detail=f"Failed to decode frame {i}")
+            # Use static mode for independent JPEG frames from web
+            landmarks = extract_landmarks_static(bgr)
+            non_zero = sum(1 for v in landmarks if v != 0.0)
+            if non_zero > 0:
+                non_zero_frames += 1
             all_landmarks.append(landmarks)
+
+        print(f"[predict_web_frames] {non_zero_frames}/{SEQUENCE_LENGTH} frames had non-zero landmarks")
 
         input_data = np.array(all_landmarks, dtype=np.float32).reshape(1, SEQUENCE_LENGTH, N_FEATURES)
         output = model.predict(input_data, verbose=0)
@@ -261,6 +289,8 @@ async def predict_web_frames(request: WebFramesRequest):
         confidence = float(probabilities[pred_index])
         all_preds = {LABELS[i]: round(float(probabilities[i]), 4) for i in range(len(LABELS))}
 
+        print(f"[predict_web_frames] Prediction: {pred_label} ({confidence:.4f})")
+
         return PredictionResponse(
             label=pred_label,
             confidence=round(confidence, 4),
@@ -269,6 +299,7 @@ async def predict_web_frames(request: WebFramesRequest):
     except HTTPException:
         raise
     except Exception as e:
+        print(f"[predict_web_frames] ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
